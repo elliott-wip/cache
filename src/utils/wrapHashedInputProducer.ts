@@ -54,8 +54,9 @@ import { wrapBulkProducer } from "./wrapBulkProducer.js";
  * the cache id from an input and a `produce` takes the full input, and the
  * wrapper keeps the input around just long enough to hand it over on a miss,
  * otherwise behaving like `wrapProducer` / `wrapBulkProducer` (same caching,
- * request-collapsing, stale-while-revalidate, abort, and diagnostics behavior;
- * see {@link WrapProducerOptions}).
+ * request-collapsing, fire-and-forget store with in-flight writes counting as
+ * hits, stale-while-revalidate, abort, and diagnostics behavior; see
+ * {@link WrapProducerOptions} and `wrapProducer`'s docs).
  *
  * ## One resource type, or several
  *

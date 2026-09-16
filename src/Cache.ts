@@ -674,7 +674,10 @@ export default class Cache<
         it,
         now,
       );
-      return { entry, maxStoreForSeconds: calculateStoreFor(entry, now) };
+      return {
+        entry,
+        maxStoreForSeconds: entryUtils.calculateStoreFor(entry, now),
+      };
     });
 
     this.#logger(
@@ -866,33 +869,6 @@ type GetManyResults<
     Params
   >;
 };
-
-/**
- * Calculates the maximum amount of time -- in seconds! -- that the backing
- * store may store the entry. It considers the producer's requested storeFor
- * time, and when the data will become definitively useless.
- *
- * @param entry The entry who's time-to-store should be calculated
- * @param at The date when the entry will be stored. This effects how long it
- *   should be stored for because, as entries get closer to the end of their
- *   freshness lifetime, the suggested storeFor time may go down (when it isn't
- *   dictated by the producer's directives).
- */
-function calculateStoreFor(
-  entry: Entry<CacheSpec, AnyValidators, AnyParams>,
-  at: Date,
-) {
-  const producerStoreFor = entry.directives.storeFor;
-  const requestedStoreFor =
-    producerStoreFor !== undefined
-      ? producerStoreFor - entry.initialAge
-      : Infinity;
-
-  return Math.max(
-    0,
-    Math.min(requestedStoreFor, entryUtils.potentiallyUsefulFor(entry, at)),
-  );
-}
 
 /**
  * The one-entry registry {@link singleTypeCacheOptions} builds. Keyed by an

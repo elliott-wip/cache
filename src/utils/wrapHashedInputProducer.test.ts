@@ -87,6 +87,42 @@ describe("wrapHashedInputProducer", () => {
     expect(producer.mock.callCount()).to.eq(1);
   });
 
+  it("an immediate sequential repeat is a hit while the store is in flight: computes once", async () => {
+    // A MemoryStore whose writes park until released, holding open the window
+    // between `produce` resolving and its store landing. No timers.
+    class GatedStore extends MemoryStore<SpecOf<typeof testRegistry>> {
+      readonly gates: (() => void)[] = [];
+      override async store(
+        ...args: Parameters<MemoryStore<SpecOf<typeof testRegistry>>["store"]>
+      ) {
+        await new Promise<void>((resolve) => this.gates.push(resolve));
+        return super.store(...args);
+      }
+    }
+    const store = new GatedStore();
+    const gatedCache = new Cache({ store, ...testCacheOptions });
+    try {
+      const produce = mock.fn(async (input: ReadonlyDeep<Input>) =>
+        result(`computed:${input.text}`),
+      );
+      const compute = wrapHashedInputProducer({
+        cache: gatedCache,
+        collapseOverlappingRequestsTime: 0,
+        hashInput,
+        produce,
+      });
+
+      const first = await compute({ text: "a" });
+      expect(store.gates).to.have.lengthOf(1); // the write is parked
+      const second = await compute({ text: "a" });
+      expect(second.content).to.eq(first.content);
+      expect(produce.mock.callCount()).to.eq(1);
+    } finally {
+      store.gates.splice(0).forEach((release) => release());
+      await gatedCache.close();
+    }
+  });
+
   it("recomputes for a different input", async () => {
     const producer = mock.fn(async (input: Input) =>
       result(input.text.toUpperCase()),

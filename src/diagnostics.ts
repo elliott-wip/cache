@@ -261,6 +261,13 @@ export type CacheFetchDisposition =
       // so a same-millisecond entry has age 0 ≤ 0, and cross-pod clock skew
       // makes age *negative* -- the producer-stamped `date` is the birth
       // basis.)
+      //
+      // One `served-from-cache` source is not a STORE read: a wrapper serves
+      // an entry it produced itself whose `cache.store()` is still in flight
+      // (see `wrapProducer`'s docs). That is a hit from the consumer's side
+      // -- the value the store read would have returned had the write landed
+      // -- so it is reported as one, but it emits no `read` message, since
+      // the read channel counts store reads.
       disposition:
         | "served-from-cache"
         | "served-stale-while-revalidating"

@@ -626,5 +626,285 @@ describe("wrapProducer", () => {
       await mockCache.close();
     });
   });
+
+  describe("in-flight stores", () => {
+    /**
+     * A MemoryStore whose `store()` does not complete until the test says so:
+     * each call parks on a gate the test can release (the write then lands in
+     * memory as usual) or fail (the write is lost and `store()` rejects). No
+     * timers anywhere -- the window under test is held open exactly as long
+     * as the test needs it.
+     */
+    class GatedStore extends MemoryStore<SpecOf<typeof testRegistry>> {
+      readonly gates: { release: () => void; fail: (e: unknown) => void }[] =
+        [];
+
+      override async store(
+        ...args: Parameters<MemoryStore<SpecOf<typeof testRegistry>>["store"]>
+      ) {
+        await new Promise<void>((resolve, reject) => {
+          this.gates.push({ release: resolve, fail: reject });
+        });
+        return super.store(...args);
+      }
+
+      releaseAll() {
+        this.gates.splice(0).forEach((gate) => gate.release());
+      }
+
+      failAll(error: unknown) {
+        this.gates.splice(0).forEach((gate) => gate.fail(error));
+      }
+    }
+
+    /**
+     * Resolves once the wrapper's own `cache.store()` promise for the i-th
+     * store call has settled AND the wrapper's settlement handlers have run.
+     * The wrapper attaches those handlers synchronously when it fires the
+     * store, so a handler attached here (later) runs after them.
+     */
+    const storeSettled = async (
+      storeSpy: { mock: { calls: { result?: unknown }[] } },
+      i: number,
+    ) => {
+      const result = storeSpy.mock.calls[i]?.result;
+      expect(result).to.be.instanceOf(Promise);
+      await (result as Promise<unknown>).then(
+        () => undefined,
+        () => undefined,
+      );
+    };
+
+    let store: GatedStore;
+    let gatedCache: TestCache;
+    let producer: ReturnType<
+      typeof mock.fn<
+        (it: {
+          id: string;
+          params: AnyParams;
+        }) => Promise<RequestPairedProducerResult<any, any, any>>
+      >
+    >;
+    let gatedSut: WrappedFn;
+
+    beforeEach(() => {
+      store = new GatedStore();
+      gatedCache = new Cache({ store, ...testCacheOptions });
+      producer = mock.fn(async (req) => ({
+        content: `produced-${producer.mock.callCount()}`,
+        directives: { freshUntilAge: 100 },
+        ...(req.id === "with-supplemental"
+          ? {
+              supplementalResources: [
+                {
+                  id: "supplemental",
+                  content: "supplemental-content",
+                  directives: { freshUntilAge: 100 },
+                },
+              ],
+            }
+          : {}),
+      }));
+      // Collapse window 0: no call rides another's invocation unless they
+      // start in the same millisecond, so the tests below exercise the
+      // overlay, not request collapsing (which has its own test here).
+      gatedSut = wrapProducer(
+        { cache: gatedCache, collapseOverlappingRequestsTime: 0 },
+        producer,
+      );
+    });
+
+    afterEach(async () => {
+      store.releaseAll();
+      await gatedCache.close();
+    });
+
+    it("an immediate sequential repeat is a hit while the store is in flight: the producer runs once", async () => {
+      const storeGet = mock.method(store, "get");
+      const storeSpy = mock.method(gatedCache, "store");
+
+      const first = await gatedSut({ id: "x" });
+      expect(producer.mock.callCount()).to.eq(1);
+      expect(store.gates).to.have.lengthOf(1); // the write is parked
+      expect(storeGet.mock.callCount()).to.eq(1); // the miss that led to it
+
+      const second = await gatedSut({ id: "x" });
+      expect(producer.mock.callCount()).to.eq(1);
+      expect(second.content).to.eq(first.content);
+      // Served from the overlay, so the store was not even read.
+      expect(storeGet.mock.callCount()).to.eq(1);
+
+      // Once the write lands, the store answers and the overlay is empty:
+      // the next call is a store read that hits.
+      store.releaseAll();
+      await storeSettled(storeSpy, 0);
+      const third = await gatedSut({ id: "x" });
+      expect(producer.mock.callCount()).to.eq(1);
+      expect(third.content).to.eq(first.content);
+      expect(storeGet.mock.callCount()).to.eq(2);
+    });
+
+    it("a failed store does not pin the entry: the next call goes back to the producer", async () => {
+      const storeSpy = mock.method(gatedCache, "store");
+
+      await gatedSut({ id: "x" });
+      expect(producer.mock.callCount()).to.eq(1);
+
+      // Still a hit while the (doomed) write is in flight...
+      await gatedSut({ id: "x" });
+      expect(producer.mock.callCount()).to.eq(1);
+
+      // ...but once it has failed, the overlay forgets the entry and the
+      // store never had it, so the producer runs again.
+      store.failAll(new Error("disk full"));
+      await storeSettled(storeSpy, 0);
+
+      const afterFailure = await gatedSut({ id: "x" });
+      expect(producer.mock.callCount()).to.eq(2);
+      expect(afterFailure.content).to.eq("produced-1");
+
+      // And that second write, once it lands, is what later calls hit.
+      store.releaseAll();
+      await storeSettled(storeSpy, 1);
+      const afterSuccess = await gatedSut({ id: "x" });
+      expect(producer.mock.callCount()).to.eq(2);
+      expect(afterSuccess.content).to.eq("produced-1");
+    });
+
+    it("concurrent duplicates still collapse onto one producer call, and the collapsed result is a hit while its store is in flight", async () => {
+      let resolveProducer!: (
+        it: RequestPairedProducerResult<any, any, any>,
+      ) => void;
+      let onProducerCalled!: () => void;
+      const producerCalled = new Promise<void>((resolve) => {
+        onProducerCalled = resolve;
+      });
+      // The FIRST invocation parks until the test resolves it (so both
+      // callers can attach to it); any later one resolves at once with
+      // distinguishable content, so a regression here fails rather than
+      // hangs.
+      let invocations = 0;
+      const slowProducer = mock.fn(
+        async (): Promise<RequestPairedProducerResult<any, any, any>> => {
+          invocations += 1;
+          return invocations === 1
+            ? new Promise((resolve) => {
+                resolveProducer = resolve;
+                onProducerCalled();
+              })
+            : { content: "not-shared", directives: { freshUntilAge: 100 } };
+        },
+      );
+      const collapsingSut: WrappedFn = wrapProducer(
+        { cache: gatedCache, collapseOverlappingRequestsTime: 10 },
+        slowProducer,
+      );
+
+      const a = collapsingSut({ id: "x" });
+      const b = collapsingSut({ id: "x" });
+      await producerCalled;
+
+      resolveProducer({
+        content: "shared",
+        directives: { freshUntilAge: 100 },
+      });
+      const [resA, resB] = await Promise.all([a, b]);
+      expect(resA.content).to.eq("shared");
+      expect(resB.content).to.eq("shared");
+      expect(slowProducer.mock.callCount()).to.eq(1);
+
+      // The invocation is over (so nothing to collapse onto) and its write is
+      // parked: a third, sequential call is answered from the overlay.
+      expect(store.gates).to.have.lengthOf(1);
+      const resC = await collapsingSut({ id: "x" });
+      expect(resC.content).to.eq("shared");
+      expect(slowProducer.mock.callCount()).to.eq(1);
+    });
+
+    it("honors variants: a pending entry is only a hit for requests its vary matches", async () => {
+      const varyingProducer = mock.fn(
+        async (req: { id: string; params: AnyParams }) => ({
+          content: `lang=${req.params["lang"] as string}`,
+          vary: { lang: req.params["lang"] },
+          directives: { freshUntilAge: 100 },
+        }),
+      );
+      const varyingSut: WrappedFn = wrapProducer(
+        { cache: gatedCache, collapseOverlappingRequestsTime: 0 },
+        varyingProducer,
+      );
+
+      const fr = await varyingSut({ id: "x", params: { lang: "fr" } });
+      expect(fr.content).to.eq("lang=fr");
+      expect(varyingProducer.mock.callCount()).to.eq(1);
+
+      // Same id, different variant: the pending `fr` entry must not answer.
+      const en = await varyingSut({ id: "x", params: { lang: "en" } });
+      expect(en.content).to.eq("lang=en");
+      expect(varyingProducer.mock.callCount()).to.eq(2);
+
+      // Both writes are still parked; each variant is a hit for its own params.
+      expect(store.gates).to.have.lengthOf(2);
+      expect(
+        (await varyingSut({ id: "x", params: { lang: "fr" } })).content,
+      ).to.eq("lang=fr");
+      expect(
+        (await varyingSut({ id: "x", params: { lang: "en" } })).content,
+      ).to.eq("lang=en");
+      expect(varyingProducer.mock.callCount()).to.eq(2);
+    });
+
+    it("honors consumer directives: a bypass request (maxAge: 0) still reaches the producer", async () => {
+      await gatedSut({ id: "x" });
+      expect(producer.mock.callCount()).to.eq(1);
+
+      await gatedSut({ id: "x", directives: { maxAge: 0 } });
+      expect(producer.mock.callCount()).to.eq(2);
+    });
+
+    it("does not serve an entry the store would not retain (storeFor: 0)", async () => {
+      const unstorableProducer = mock.fn(async () => ({
+        content: "do-not-store",
+        directives: { freshUntilAge: 100, storeFor: 0 },
+      }));
+      const unstorableSut: WrappedFn = wrapProducer(
+        { cache: gatedCache, collapseOverlappingRequestsTime: 0 },
+        unstorableProducer,
+      );
+
+      await unstorableSut({ id: "x" });
+      await unstorableSut({ id: "x" });
+      expect(unstorableProducer.mock.callCount()).to.eq(2);
+    });
+
+    it("a supplemental resource whose store is in flight is a hit for its own id", async () => {
+      await gatedSut({ id: "with-supplemental" });
+      expect(producer.mock.callCount()).to.eq(1);
+      expect(store.gates).to.have.lengthOf(1);
+
+      const supplemental = await gatedSut({ id: "supplemental" });
+      expect(supplemental.content).to.eq("supplemental-content");
+      expect(producer.mock.callCount()).to.eq(1);
+    });
+
+    it("the overlay is per wrapper: a second wrapper over the same cache reads the store", async () => {
+      const otherProducer = mock.fn(async () => ({
+        content: "other",
+        directives: { freshUntilAge: 100 },
+      }));
+      const otherSut: WrappedFn = wrapProducer(
+        { cache: gatedCache, collapseOverlappingRequestsTime: 0 },
+        otherProducer,
+      );
+
+      await gatedSut({ id: "x" });
+      expect(producer.mock.callCount()).to.eq(1);
+
+      // The first wrapper's write is still parked, and the second wrapper
+      // has no view of it: it misses and produces.
+      await otherSut({ id: "x" });
+      expect(otherProducer.mock.callCount()).to.eq(1);
+    });
+  });
 });
 /* eslint-enable @typescript-eslint/no-explicit-any */

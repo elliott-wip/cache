@@ -53,6 +53,35 @@ export function potentiallyUsefulFor(
 }
 
 /**
+ * Calculates the maximum amount of time -- in seconds! -- that the backing
+ * store may store the entry. `Cache.store` hands the result to the store as
+ * `maxStoreForSeconds`; a result of 0 means the store will not retain the entry
+ * at all (which is what a producer's `storeFor: 0` asks for). It considers the producer's requested storeFor
+ * time, and when the data will become definitively useless.
+ *
+ * @param entry The entry who's time-to-store should be calculated
+ * @param at The date when the entry will be stored. This effects how long it
+ *   should be stored for because, as entries get closer to the end of their
+ *   freshness lifetime, the suggested storeFor time may go down (when it isn't
+ *   dictated by the producer's directives).
+ */
+export function calculateStoreFor(
+  entry: AnyNormalizedProducerResultResource,
+  at: Date,
+) {
+  const producerStoreFor = entry.directives.storeFor;
+  const requestedStoreFor =
+    producerStoreFor !== undefined
+      ? producerStoreFor - entry.initialAge
+      : Infinity;
+
+  return Math.max(
+    0,
+    Math.min(requestedStoreFor, potentiallyUsefulFor(entry, at)),
+  );
+}
+
+/**
  * Returns whether the entry has data that can be used for revalidation.
  */
 export function isValidatable(it: AnyNormalizedProducerResultResource) {
