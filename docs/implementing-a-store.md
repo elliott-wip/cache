@@ -38,6 +38,12 @@ When making performance/implementation tradeoffs, consider that the following as
 
     - The number of variants for a resource can be unboundedly-large. This happens especially for resources that have one variant _per user_ (i.e., vary on a param like `user-id` or, in the HTTP context, `Authorization` or `Cookie`). Therefore, assuming the entries are stored in some backing database, it's generally not safe to simply load all the entries for a given resource into JS memory and filter them there. (However, a Store could do this if it put some limit on how many entries it would load per resource in a `get()` call -- at the expense of artificially lowering the hit rate in these sorts of cases by not returning all matching entries.)
 
+3.  `getMany()` should read all of its requests in one round trip to the backing database -- for example, one `where id in (...)` query -- and not call `get()` once per request. `Cache.getMany()` and the `batchReads` cache option both exist to turn many lookups into one `getMany()` call, so a `getMany()` that loops over `get()` silently removes the benefit of both. The exported `naiveGetMany` helper is that loop: it is a correct starting point, not a finished implementation.
+
+    A one-query `getMany()` cannot usually push each request's params into the query, so it fetches every variant of each requested id and filters them in JS with `variantMatchesRequest` (as `PostgresStore` and `SqliteStore` do). The same caveat as above applies: this is only safe while each resource has few variants.
+
+    Whatever the implementation, `getMany()` must return, for each request, the same entries that `get()` would return for it, in one result array per request and in input order, keeping duplicate requests and misses. The store-conformance suite checks this with a property test.
+
 ## Gotchas for stores that serialize entries as JSON
 
 If your store persists entries by JSON-encoding them (as the `PostgresStore` and `SqliteStore` do), be aware that both `JSON.stringify` and `safe-stable-stringify` convert `Infinity` to `null`. Producers can legitimately return entries with `Infinity` in directives like `freshUntilAge` (to say "this value never expires"), `storeFor`, or any of the `maxStale` thresholds, and that intent must survive the roundtrip. Otherwise the deserialized entry will have `null` where a `number` is expected, and comparisons in the `Cache` class will silently treat it as `0` — turning a "never expires" entry into one that expires immediately.
