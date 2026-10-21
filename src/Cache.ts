@@ -209,46 +209,16 @@ export type CacheOptions<
   normalizeParamName?: NormalizeParamName<Params>;
   normalizeParamValue?: NormalizeParamValue<Params>;
   /**
-   * When `true`, the `get()` calls made in one event-loop turn share one
-   * `store.getMany()` call, instead of one `store.get()` call each. Defaults
-   * to `false`.
+   * Batch concurrent `get()` calls into `store.getMany()` calls of up to 500
+   * requests, flushed on the next `setImmediate`. Defaults to `false`.
    *
-   * Turn it on for a cache whose callers fan out many concurrent `get()`
-   * calls -- for example, a `wrapProducer` loader called once per id -- over a
-   * store whose `get` costs a round trip, such as `PostgresStore`. It only
-   * saves round trips when the store's `getMany` reads all of its requests in
-   * one operation; a store that implements `getMany` with `naiveGetMany`
-   * still runs one `get` per request.
+   * Useful for per-id fan-out over stores with efficient bulk reads, such as
+   * `PostgresStore`. Each request keeps its own result, freshness check,
+   * abort signal, and diagnostics. A failed `getMany()` rejects all requests
+   * in that call.
    *
-   * What batching changes:
-   * - A read waits for the end of the current event-loop turn (one
-   *   `setImmediate`) before its query starts. Reads that reach the cache in
-   *   later turns go into later batches.
-   * - One flush passes at most 500 requests to one `getMany` call. A larger
-   *   flush runs several `getMany` calls concurrently.
-   * - The shared `getMany` call runs without an abort signal. A request whose
-   *   signal aborts, while it waits for its flush or while its batch's query
-   *   runs, rejects at once with the signal's reason and publishes no `read`
-   *   message, as an aborted unbatched read does.
-   * - When a `getMany` call fails, every request in that call rejects with
-   *   its error, and each publishes its own `read-failed` message. The cause
-   *   can be one request's input: for example, Postgres rejects a statement
-   *   that binds an id with U+0000, so that id fails every request that
-   *   shares its `getMany` call, including other callers' requests.
-   * - `close()` starts the queued reads before it closes the store. It does
-   *   not wait for them to settle, as it does not wait for unbatched reads.
-   * - The shared query runs in the async context (for example, the
-   *   `AsyncLocalStorage` stores and the active tracing span) of the `get()`
-   *   that opened the batch.
-   * - The store answers each request with `getMany`, not `get`. These agree
-   *   for every input that both accept. `PostgresStore.get` also rejects a
-   *   string param that holds U+0000 or a lone surrogate, which its
-   *   `getMany` matches in JS instead.
-   *
-   * What batching does not change: requests share one query, never one
-   * result. Each `get()` still classifies its own id, honors the closed-cache
-   * options, evaluates freshness at its own `now`, selects its own entry, and
-   * publishes exactly one `read` message.
+   * See [Batching concurrent reads](../README.md#batching-concurrent-reads-batchreads)
+   * for examples and details on aborts, shutdown, tracing, and store limits.
    */
   batchReads?: boolean;
 };
