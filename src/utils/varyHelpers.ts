@@ -70,6 +70,40 @@ export function variantMatchesRequest<V extends AnyParams>(
 }
 
 /**
+ * Picks each request's variants for a store whose `getMany` fetches every
+ * stored variant of the requested ids in one query. A request's variants are
+ * the ones stored under its id whose `vary` its params satisfy (see
+ * {@link variantMatchesRequest}). Returns one array per request, in request
+ * order.
+ *
+ * Variants are looked up by `id.toWellFormed()`. A SQL driver sends text as
+ * UTF-8, which has no lone UTF-16 surrogates, so the database stores and
+ * returns a lone surrogate as U+FFFD. `get` binds the raw id and so finds
+ * those rows. This lookup makes the same replacement, so `getMany` finds
+ * them too.
+ */
+export function variantsMatchingRequests<
+  V extends AnyParams,
+  Variant extends {
+    readonly id: string;
+    readonly vary: Readonly<NormalizedVary<V>>;
+  },
+>(
+  variants: readonly Variant[],
+  requests: readonly {
+    readonly id: string;
+    readonly params: Readonly<NormalizedParams<V>>;
+  }[],
+): Variant[][] {
+  const variantsById = Map.groupBy(variants, ({ id }) => id);
+  return requests.map(({ id, params }) =>
+    (variantsById.get(id.toWellFormed()) ?? []).filter(({ vary }) =>
+      variantMatchesRequest(vary, params),
+    ),
+  );
+}
+
+/**
  * Read a request param by name with *own-property* semantics, returning
  * `undefined` when the param is absent.
  *

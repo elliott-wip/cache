@@ -18,7 +18,6 @@ import MemoryStore from "./stores/MemoryStore/MemoryStore.js";
 import type { CacheSpec } from "./types/00_CacheSpec.js";
 import type { AnyParams } from "./types/01_Params.js";
 import type { AnyValidators } from "./types/02_Validators.js";
-import { MAX_REQUESTS_PER_BATCHED_GET_MANY } from "./utils/storeReadBatcher.js";
 import wrapProducer from "./utils/wrapProducer.js";
 
 /**
@@ -55,19 +54,10 @@ function spiedStore(options?: { beforeGetMany?: () => Promise<void> }) {
   };
 }
 
-/** A gate that holds a store read open until the test releases it. */
-function gate() {
-  const { promise, resolve } = Promise.withResolvers<void>();
-  return { wait: async () => promise, release: () => resolve() };
-}
-
-const batchedCacheOver = (
-  store: MemoryStore<Spec, AnyValidators, AnyParams>,
-  name = uniqueCacheName("batch-reads"),
-) =>
+const batchedCacheOver = (store: MemoryStore<Spec, AnyValidators, AnyParams>) =>
   new Cache({
     store,
-    name,
+    name: uniqueCacheName("batch-reads"),
     resourceTypes: ACCEPT_ANY_REGISTRY,
     batchReads: true,
   });
@@ -85,8 +75,7 @@ const suiteOptions = { timeout: 20_000 };
 describe("Cache with batchReads", suiteOptions, () => {
   it("serves concurrent gets from one getMany call, with each request's own result", async () => {
     const { store, getCallCount, getManyRequestCounts } = spiedStore();
-    const name = uniqueCacheName("batch-reads");
-    const batched = batchedCacheOver(store, name);
+    const batched = batchedCacheOver(store);
     const unbatched = new Cache({
       store,
       name: uniqueCacheName("unbatched"),
@@ -112,7 +101,7 @@ describe("Cache with batchReads", suiteOptions, () => {
       ...Array.from({ length: 6 }, (_, i) => lookup(`missing:${String(i)}`)),
     ];
 
-    const capture = captureChannels(name);
+    const capture = captureChannels(batched.name);
     try {
       const batchedResults = await Promise.all(
         requests.map(async (req) => batched.get(req)),
@@ -192,7 +181,7 @@ describe("Cache with batchReads", suiteOptions, () => {
       ids.map(async (id) => cache.get(lookup(id))),
     );
 
-    assert.equal(MAX_REQUESTS_PER_BATCHED_GET_MANY, 500);
+    // README.md and the batchReads docs state the 500 cap.
     assert.deepEqual(getManyRequestCounts(), [500, 500, 200]);
     assert.deepEqual(
       results.map((it) => it.usable?.content),
@@ -202,12 +191,11 @@ describe("Cache with batchReads", suiteOptions, () => {
 
   it("rejects only the request whose signal aborts while it waits, and drops it from the query", async () => {
     const { store, getManyRequestCounts } = spiedStore();
-    const name = uniqueCacheName("batch-reads");
-    const cache = batchedCacheOver(store, name);
+    const cache = batchedCacheOver(store);
     const controller = new AbortController();
     const reason = new Error("caller gave up");
 
-    const capture = captureChannels(name);
+    const capture = captureChannels(cache.name);
     try {
       const pending = [
         cache.get(lookup("a")),
@@ -231,9 +219,9 @@ describe("Cache with batchReads", suiteOptions, () => {
   });
 
   it("rejects a request at once when its signal aborts while its batch's query runs", async () => {
-    const query = gate();
+    const query = Promise.withResolvers<void>();
     const { store, getManyRequestCounts } = spiedStore({
-      beforeGetMany: query.wait,
+      beforeGetMany: async () => query.promise,
     });
     const cache = batchedCacheOver(store);
     const controller = new AbortController();
@@ -258,22 +246,22 @@ describe("Cache with batchReads", suiteOptions, () => {
     ]);
     assert.equal(settledWhileQueryRuns, reason);
 
-    query.release();
+    query.resolve();
     assert.equal((await other).usable, undefined);
     assert.deepEqual(getManyRequestCounts(), [2]);
   });
 
   it("rejects every request in a failed getMany call, with one read-failed message each", async () => {
-    const store = new MemoryStore<Spec, AnyValidators, AnyParams>();
     const failure = new Error("store is down");
-    mock.method(store, "getMany", async () => {
-      throw failure;
+    const { store } = spiedStore({
+      beforeGetMany: async () => {
+        throw failure;
+      },
     });
-    const name = uniqueCacheName("batch-reads");
-    const cache = batchedCacheOver(store, name);
+    const cache = batchedCacheOver(store);
     const ids = Array.from({ length: 10 }, (_, i) => `id:${String(i)}`);
 
-    const capture = captureChannels(name);
+    const capture = captureChannels(cache.name);
     try {
       const settled = await Promise.allSettled(
         ids.map(async (id) => cache.get(lookup(id))),
@@ -299,17 +287,12 @@ describe("Cache with batchReads", suiteOptions, () => {
   });
 
   it("starts queued reads before close() closes the store", async () => {
-    const store = new MemoryStore<Spec, AnyValidators, AnyParams>();
     const events: string[] = [];
-    const getMany = store.getMany.bind(store);
-    mock.method(
-      store,
-      "getMany",
-      async (...args: Parameters<typeof getMany>) => {
+    const { store } = spiedStore({
+      beforeGetMany: async () => {
         events.push("getMany");
-        return getMany(...args);
       },
-    );
+    });
     const close = store.close.bind(store);
     mock.method(store, "close", async () => {
       events.push("close");

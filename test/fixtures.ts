@@ -190,7 +190,8 @@ export function postgresStoreFixture(options?: {
     const onQuery = options?.onQuery;
     if (onQuery !== undefined) {
       // Wrap each client's `query` as the pool creates the client. Kysely's
-      // Postgres driver always calls `query(text, parameters)`.
+      // Postgres driver always calls `query(text, parameters)`. The fixture's
+      // own `cleanup` sends a statement with no parameters, which reports `[]`.
       postgres.on("connect", (client) => {
         const query = client.query.bind(client) as (
           ...args: unknown[]
@@ -200,10 +201,7 @@ export function postgresStoreFixture(options?: {
           parameters: unknown,
           ...rest: unknown[]
         ) => {
-          onQuery(
-            String(text),
-            Array.isArray(parameters) ? (parameters as unknown[]) : [],
-          );
+          onQuery(String(text), Array.isArray(parameters) ? parameters : []);
           return query(text, parameters, ...rest);
         }) as typeof client.query;
       });

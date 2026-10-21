@@ -19,6 +19,7 @@ import type { StoreEntryResult } from "../../types/06_Store.js";
 import { validatorsEqual } from "../../utils/normalizedProducerResultResourceHelpers.js";
 import {
   variantMatchesRequest,
+  variantsMatchingRequests,
   type VariantKey,
 } from "../../utils/varyHelpers.js";
 
@@ -386,20 +387,18 @@ function getManyMatchingEntryJson(
 ): WorkerEntryJson[][] {
   if (requests.length === 0) return [];
 
-  const rowsById = Map.groupBy(
-    context.selectByIds(requests.map(({ id }) => id)),
-    ({ resource_id }) => resource_id,
-  );
+  const variants = context
+    .selectByIds(requests.map(({ id }) => id))
+    .map((row) => ({
+      id: row.resource_id,
+      vary: jsonParse(row.vary),
+      entry: row.entry,
+    }));
 
-  // Look rows up by the id as SQLite stores it. SQLite receives each bound id
-  // as UTF-8, so a lone UTF-16 surrogate in a request id reaches the table, and
-  // comes back, as U+FFFD. `toWellFormed` makes the same replacement, so a
-  // request still finds the rows that `get` would find for it.
-  return requests.map(({ id, params }) =>
-    (rowsById.get(id.toWellFormed()) ?? [])
-      .filter((row) => variantMatchesRequest(jsonParse(row.vary), params))
-      .map((row) => row.entry),
-  );
+  return variantsMatchingRequests<AnyParams, (typeof variants)[number]>(
+    variants,
+    requests,
+  ).map((matches) => matches.map(({ entry }) => entry));
 }
 
 /**

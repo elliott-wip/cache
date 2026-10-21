@@ -40,7 +40,7 @@ When making performance/implementation tradeoffs, consider that the following as
 
 3.  `getMany()` should read all of its requests in one round trip to the backing database -- for example, one `where id in (...)` query -- and not call `get()` once per request. `Cache.getMany()` and the `batchReads` cache option both exist to turn many lookups into one `getMany()` call, so a `getMany()` that loops over `get()` silently removes the benefit of both. The exported `naiveGetMany` helper is that loop: it is a correct starting point, not a finished implementation.
 
-    A one-query `getMany()` cannot usually push each request's params into the query, so it fetches every variant of each requested id and filters them in JS with `variantMatchesRequest` (as `PostgresStore` and `SqliteStore` do). The same caveat as above applies: this is only safe while each resource has few variants.
+    A one-query `getMany()` cannot usually push each request's params into the query, so it fetches every variant of each requested id and filters them in JS with `variantMatchesRequest` (as `PostgresStore` and `SqliteStore` do). The same caveat as above applies: this is only safe while each resource has few variants. If your database driver sends text as UTF-8, look each request's rows up by `id.toWellFormed()`, not by the raw id. UTF-8 has no lone UTF-16 surrogates, so the database stores and returns one as U+FFFD, and `get` finds that row for the raw id.
 
     Whatever the implementation, `getMany()` must return, for each request, the same entries that `get()` would return for it, in one result array per request and in input order, keeping duplicate requests and misses. The store-conformance suite checks this with a property test.
 

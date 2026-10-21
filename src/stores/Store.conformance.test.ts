@@ -1,3 +1,4 @@
+import { sortBy } from "es-toolkit";
 import fc from "fast-check";
 import assert from "node:assert/strict";
 import { mkdtemp, rm } from "node:fs/promises";
@@ -492,14 +493,7 @@ function defineStoreConformance(createFixture: () => Promise<StoreFixture>) {
       // sets.
       const inCanonicalOrder = (
         entries: readonly Entry<TestSpec, AnyValidators, TestParams>[],
-      ) =>
-        entries.toSorted((a, b) => {
-          const [keyA, keyB] = [
-            String(jsonStringify(a)),
-            String(jsonStringify(b)),
-          ];
-          return keyA < keyB ? -1 : keyA > keyB ? 1 : 0;
-        });
+      ) => sortBy(entries, [(entry) => String(jsonStringify(entry))]);
 
       // Every run, including a replay of a reported counterexample, writes
       // under its own id prefix, so it never reads another run's entries.

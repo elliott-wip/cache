@@ -47,7 +47,7 @@ import {
   jsonStringify,
   keepMaxPerGroup,
 } from "../../utils/utils.js";
-import { variantMatchesRequest } from "../../utils/varyHelpers.js";
+import { variantsMatchingRequests } from "../../utils/varyHelpers.js";
 
 /**
  * The most unique ids that one `getMany` statement binds. Postgres allows
@@ -171,7 +171,8 @@ function varyMatchesParamsSql<Params extends PostgresStoreSupportedParams>(
  * We do not use any mechanisms to speed up the entry lookup aside from an index
  * on the vary column. We rely on Postgres to be fast enough for our needs.
  *
- * `getMany` reads up to 1,000 unique ids in one round trip (see its docs), so
+ * `getMany` reads up to {@link MAX_IDS_PER_GET_MANY_QUERY} unique ids in one
+ * round trip (see its docs), so
  * a caller with many ids should use it, or a `Cache` with `batchReads`, rather
  * than many concurrent `get` calls: each `get` is its own query and holds its
  * own pool connection.
@@ -332,33 +333,17 @@ export default class PostgresStore<
       signal?.throwIfAborted();
     }
 
-    // Group by the id as Postgres stores it. Postgres receives each id as
-    // UTF-8, so a lone UTF-16 surrogate in a request id reaches the table, and
-    // comes back, as U+FFFD. `toWellFormed` makes the same replacement, so a
-    // request still finds the rows that `get` would find for it.
-    //
     // Each row is deserialized once, so duplicate requests for one id share
-    // entry objects, as concurrent `MemoryStore` reads do.
-    const variantsById = Map.groupBy(
-      rows.map((row) => ({
-        id: row.resource_id,
-        vary: row.vary,
-        entry: this.deserializeEntry(
-          row.entry satisfies TableEntry<
-            Spec,
-            Validators,
-            Params,
-            Spec["id"]
-          > as unknown as TableEntry<Spec, Validators, Params, Spec["id"]>,
-        ),
-      })),
-      ({ id }) => id,
-    );
-
-    const results = requests.map(({ id, params }) =>
-      (variantsById.get(id.toWellFormed()) ?? [])
-        .filter(({ vary }) => variantMatchesRequest(vary, params))
-        .map(({ entry }) => entry),
+    // entry objects, as concurrent `MemoryStore` reads do. That is sound while
+    // no reader mutates a returned entry, and `Cache` and the producer
+    // wrappers do not.
+    const variants = rows.map((row) => ({
+      id: row.resource_id,
+      vary: row.vary,
+      entry: this.deserializeEntry(row.entry),
+    }));
+    const results = variantsMatchingRequests(variants, requests).map(
+      (matches) => matches.map(({ entry }) => entry),
     );
 
     this.logTrace("returning entries from postgres getMany query", {
