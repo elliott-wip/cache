@@ -155,7 +155,30 @@ export function dummyEntryData(
   );
 }
 
-export function postgresStoreFixture() {
+/**
+ * Whether the environment names a test Postgres database. Suites that need one
+ * skip themselves when it does not; `pnpm test:docker` provides one.
+ */
+export function postgresEnvironmentIsConfigured(): boolean {
+  return [
+    "DATABASE_HOST",
+    "DATABASE_PORT",
+    "DATABASE_NAME",
+    "DATABASE_USER",
+    "DATABASE_PASSWORD",
+  ].every(
+    (key) => typeof process.env[key] === "string" && process.env[key] !== "",
+  );
+}
+
+/**
+ * @param options.onQuery - Called with the text and parameters of every
+ *  statement that any of the fixture's pool clients sends. Tests use it to
+ *  count the round trips that a store operation makes.
+ */
+export function postgresStoreFixture(options?: {
+  onQuery?: (text: string, parameters: readonly unknown[]) => void;
+}) {
   try {
     const postgres = new pg.Pool({
       host: process.env["DATABASE_HOST"]!, // eslint-disable-line @typescript-eslint/no-non-null-assertion
@@ -164,6 +187,27 @@ export function postgresStoreFixture() {
       user: process.env["DATABASE_USER"]!, // eslint-disable-line @typescript-eslint/no-non-null-assertion
       password: process.env["DATABASE_PASSWORD"]!, // eslint-disable-line @typescript-eslint/no-non-null-assertion
     });
+    const onQuery = options?.onQuery;
+    if (onQuery !== undefined) {
+      // Wrap each client's `query` as the pool creates the client. Kysely's
+      // Postgres driver always calls `query(text, parameters)`.
+      postgres.on("connect", (client) => {
+        const query = client.query.bind(client) as (
+          ...args: unknown[]
+        ) => unknown;
+        client.query = ((
+          text: unknown,
+          parameters: unknown,
+          ...rest: unknown[]
+        ) => {
+          onQuery(
+            String(text),
+            Array.isArray(parameters) ? (parameters as unknown[]) : [],
+          );
+          return query(text, parameters, ...rest);
+        }) as typeof client.query;
+      });
+    }
     // Use a new schema AND table name for each store instance so that tests
     // (and test files, which node runs in parallel) can't interfere with each
     // other: cleanup drops the whole schema, so a schema shared across

@@ -5,8 +5,15 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
 
-import { NormalizedProducerDirectivesArb } from "../../test/arbitraries/06_Normalization.js";
-import { postgresStoreFixture } from "../../test/fixtures.js";
+import {
+  NormalizedParamsArb,
+  NormalizedProducerDirectivesArb,
+} from "../../test/arbitraries/06_Normalization.js";
+import { StoreEntryInputArb } from "../../test/arbitraries/06_Store.js";
+import {
+  postgresEnvironmentIsConfigured,
+  postgresStoreFixture,
+} from "../../test/fixtures.js";
 import type {
   AnyValidators,
   CacheSpec,
@@ -16,6 +23,7 @@ import type {
   NormalizedVary,
   Store,
 } from "../types/index.js";
+import { jsonStringify } from "../utils/utils.js";
 import MemoryStore from "./MemoryStore/MemoryStore.js";
 import type { PostgresStoreSupportedParams } from "./PostgresStore/PostgresStore.js";
 import SqliteStore from "./SqliteStore/SqliteStore.js";
@@ -420,6 +428,131 @@ function defineStoreConformance(createFixture: () => Promise<StoreFixture>) {
     });
   });
 
+  it("finds, through getMany, the entries that get finds for a lone-surrogate id", async () => {
+    await withStore(createFixture, async (store) => {
+      // A driver that sends text as UTF-8 cannot send a lone UTF-16
+      // surrogate, so a SQL store holds "\ud800x" as "�x", and `get` for
+      // either spelling finds the row. `getMany` must agree with `get`.
+      await store.store([
+        {
+          entry: makeEntry("�x", "replaced", emptyVary),
+          maxStoreForSeconds: 60,
+        },
+      ]);
+
+      const viaGet = await store.get("\ud800x", matchingParams);
+      const [viaGetMany] = await store.getMany([
+        { id: "\ud800x", params: matchingParams },
+      ] as const);
+
+      assert.deepEqual(viaGetMany, viaGet);
+    });
+  });
+
+  it("returns from getMany, per request, what get returns for that request", async () => {
+    await withStore(createFixture, async (store) => {
+      // A small param space, so that random requests often match stored
+      // variants. `constructor` collides with an Object.prototype member, which
+      // a matcher must treat as an ordinary param.
+      const paramsArb = fc.record(
+        {
+          format: fc.constantFrom("json", "html"),
+          lang: fc.constantFrom("en", "es"),
+          count: fc.constantFrom(0, 1, 2.5),
+          flag: fc.boolean(),
+          constructor: fc.constantFrom("x", "y"),
+        },
+        { requiredKeys: [] },
+      ) as fc.Arbitrary<TestParams>;
+
+      const entriesArb = fc.array(
+        StoreEntryInputArb(
+          fc.string().map((value): TestContent => ({ value })),
+          fc.dictionary(fc.string({ minLength: 1 }), fc.string()),
+          paramsArb,
+          fc.constantFrom("a", "b", "c", "�x"),
+        )
+          // An invalid date cannot round-trip through a JSON store.
+          .filter(({ entry }) => !Number.isNaN(entry.date.getTime()))
+          // Long-lived, so that no entry expires between the get and getMany
+          // reads below.
+          .map((input) => ({ ...input, maxStoreForSeconds: 3600 })),
+        { minLength: 1, maxLength: 12 },
+      );
+
+      const randomRequestsArb = fc.array(
+        fc.record({
+          id: fc.constantFrom("a", "b", "c", "missing", "\ud800x", "�x"),
+          params: NormalizedParamsArb(paramsArb),
+        }),
+        { maxLength: 12 },
+      );
+
+      // Order within one request's entries is unspecified, so compare them as
+      // sets.
+      const inCanonicalOrder = (
+        entries: readonly Entry<TestSpec, AnyValidators, TestParams>[],
+      ) =>
+        entries.toSorted((a, b) => {
+          const [keyA, keyB] = [
+            String(jsonStringify(a)),
+            String(jsonStringify(b)),
+          ];
+          return keyA < keyB ? -1 : keyA > keyB ? 1 : 0;
+        });
+
+      // Every run, including a replay of a reported counterexample, writes
+      // under its own id prefix, so it never reads another run's entries.
+      const runs = { count: 0 };
+
+      await fc.assert(
+        fc.asyncProperty(
+          entriesArb,
+          randomRequestsArb,
+          async (inputs, randomRequests) => {
+            runs.count += 1;
+            const scoped = (id: string) => `run-${String(runs.count)}:${id}`;
+            await store.store(
+              inputs.map((input) => ({
+                ...input,
+                entry: { ...input.entry, id: scoped(input.entry.id) },
+              })),
+            );
+
+            // One request per stored entry, with params that select its
+            // variant, so every run compares non-empty results too.
+            const matchingRequests = inputs.map(({ entry }) => ({
+              id: entry.id,
+              params: Object.fromEntries(
+                Object.entries(entry.vary).filter(([, v]) => v !== null),
+              ) as NormalizedParams<TestParams>,
+            }));
+            const requests = [...matchingRequests, ...randomRequests].map(
+              ({ id, params }) => ({ id: scoped(id), params }),
+            );
+
+            const viaGetMany = await store.getMany(requests);
+            const viaGet = await Promise.all(
+              requests.map(async ({ id, params }) => store.get(id, params)),
+            );
+
+            assert.ok(
+              viaGet
+                .slice(0, matchingRequests.length)
+                .every((entries) => entries.length > 0),
+              "a request built from a stored entry's vary must match it",
+            );
+            assert.deepEqual(
+              viaGetMany.map(inCanonicalOrder),
+              viaGet.map(inCanonicalOrder),
+            );
+          },
+        ),
+        { numRuns: 50 },
+      );
+    });
+  });
+
   it("deletes all variants for an id and leaves other ids alone", async () => {
     await withStore(createFixture, async (store) => {
       await store.store([
@@ -562,16 +695,4 @@ function snapshotEntry(entry: Entry<TestSpec, AnyValidators, TestParams>) {
     ...entry,
     date: entry.date.toISOString(),
   };
-}
-
-function postgresEnvironmentIsConfigured(): boolean {
-  return [
-    "DATABASE_HOST",
-    "DATABASE_PORT",
-    "DATABASE_NAME",
-    "DATABASE_USER",
-    "DATABASE_PASSWORD",
-  ].every(
-    (key) => typeof process.env[key] === "string" && process.env[key] !== "",
-  );
 }

@@ -1,3 +1,4 @@
+import { chunk } from "es-toolkit";
 import type {
   ColumnType,
   PostgresPool,
@@ -45,8 +46,15 @@ import {
   defaultLoggersByComponent,
   jsonStringify,
   keepMaxPerGroup,
-  naiveGetMany,
 } from "../../utils/utils.js";
+import { variantMatchesRequest } from "../../utils/varyHelpers.js";
+
+/**
+ * The most unique ids that one `getMany` statement binds. Postgres allows
+ * 65,535 bind parameters in one statement, so this is far below the limit. It
+ * keeps each statement's `in` list and result set to a bounded size.
+ */
+const MAX_IDS_PER_GET_MANY_QUERY = 1_000;
 
 /**
  * Type representing the qualified name of the cache table.
@@ -75,8 +83,8 @@ type CacheTables<
     resource_id: ColumnType<string, string, never>;
     // Select type is `NormalizedVary` (not `NormalizedParams`) because the
     // stored value can carry `null` values -- a `null` vary value means "this
-    // variant applies only when the request omits that param". `get` reads this
-    // column back to match variants in JS via `variantMatchesRequest`.
+    // variant applies only when the request omits that param". `getMany` reads
+    // this column back to match variants in JS via `variantMatchesRequest`.
     vary: ColumnType<
       Readonly<NormalizedVary<Params>>,
       JsonOf<NormalizedVary<Params>>,
@@ -96,11 +104,12 @@ type CacheTables<
  * `get` matches variants in the database (see `varyMatchesParamsSql`): a
  * non-null vary value must `jsonb`-equal the corresponding param, and a `null`
  * vary value requires the param to be *absent*. `jsonb` equality is exact at
- * every level, so object/array values would in fact match correctly -- but the
+ * every level, so object/array values would match correctly in `get`. The
  * param type is still limited to primitives, because that's all real callers
- * use and it keeps the contract identical to the Memory/Sqlite stores, whose JS
- * matcher (`variantMatchesRequest`) compares with `===` and so cannot
- * deep-compare objects.
+ * use, and because `getMany` matches in JS with `variantMatchesRequest`, which
+ * compares with `===` and so cannot deep-compare objects. For primitives the
+ * two matchers agree, which keeps `get` and `getMany` (and the Memory/Sqlite
+ * stores) on one contract.
  *
  * A previous implementation matched via the JSONB containment operator
  * (`vary <@ $params`). It was replaced because containment cannot express the
@@ -161,6 +170,11 @@ function varyMatchesParamsSql<Params extends PostgresStoreSupportedParams>(
  *
  * We do not use any mechanisms to speed up the entry lookup aside from an index
  * on the vary column. We rely on Postgres to be fast enough for our needs.
+ *
+ * `getMany` reads up to 1,000 unique ids in one round trip (see its docs), so
+ * a caller with many ids should use it, or a `Cache` with `batchReads`, rather
+ * than many concurrent `get` calls: each `get` is its own query and holds its
+ * own pool connection.
  */
 export default class PostgresStore<
   Spec extends PostgresStoreCompatibleSpec = PostgresStoreCompatibleSpec,
@@ -256,26 +270,104 @@ export default class PostgresStore<
     return entries;
   }
 
+  /**
+   * Reads the entries for all requests with one `resource_id in (...)`
+   * statement per {@link MAX_IDS_PER_GET_MANY_QUERY} unique ids. It then
+   * filters each request's rows in JS with `variantMatchesRequest`, as
+   * `SqliteStore` does, rather than in SQL as `get` does.
+   *
+   * The two matchers agree for every param value that both can evaluate:
+   * `get`'s `jsonb` equality and `variantMatchesRequest`'s `===` give the same
+   * answer for strings, numbers, and booleans, and both read a `null` vary
+   * value as "the param must be absent". The store-conformance suite checks
+   * this agreement with a property test. One difference: Postgres cannot read
+   * a `jsonb` string that holds U+0000 or a lone surrogate, so `get` rejects a
+   * request with such a param value, and `getMany` matches it in JS. No stored
+   * variant can hold such a value, because `store` rejects it too.
+   *
+   * Unlike `get`, this loads EVERY stored variant of each requested id into
+   * JS. That is cheap while each id holds a few variants, which is the usual
+   * case. A cache whose producers vary on a high-cardinality param (one
+   * variant per user, say) should not read through `getMany`; see
+   * `docs/implementing-a-store.md`.
+   *
+   * The statements for a batch of more than one chunk are not in one
+   * transaction, so a concurrent write can land between them. That is the same
+   * consistency that separate `get` calls give, and it is enough for a cache.
+   */
   async getMany<
     const Reqs extends readonly StoreGetManyRequest<Spec, Params>[],
   >(
     requests: Reqs,
     options?: { signal?: AbortSignal },
   ): Promise<StoreGetManyResult<Spec, Reqs, Validators, Params>> {
+    const signal = options?.signal;
+    signal?.throwIfAborted();
+
     this.logTrace("querying for multiple entries", {
       requestCount: requests.length,
     });
 
-    // For PostgresStore, we'll use the naive implementation until we have time
-    // to optimize it. Technically, all these calls should probably be wrapped
-    // in a transaction, so that concurrent deletes can't lead us to returning
-    // partial/incosistent state, but that doesn't really matter for this cache.
-    return naiveGetMany<Spec, Validators, Params, Reqs>(
-      this,
-      requests,
-      undefined,
-      options,
+    if (requests.length === 0) {
+      return [] as StoreGetManyResult<Spec, Reqs, Validators, Params>;
+    }
+
+    await this.ensureInitializedPromise;
+
+    signal?.throwIfAborted();
+
+    const uniqueIds = [...new Set(requests.map(({ id }) => id))];
+
+    // Chunks run one after another, so a large batch holds one pool connection
+    // at a time instead of one per chunk.
+    const rows = [];
+    for (const ids of chunk(uniqueIds, MAX_IDS_PER_GET_MANY_QUERY)) {
+      rows.push(
+        ...(await this.db
+          .selectFrom(this.tableName)
+          .where("resource_id", "in", ids)
+          .selectAll()
+          .execute()),
+      );
+      signal?.throwIfAborted();
+    }
+
+    // Group by the id as Postgres stores it. Postgres receives each id as
+    // UTF-8, so a lone UTF-16 surrogate in a request id reaches the table, and
+    // comes back, as U+FFFD. `toWellFormed` makes the same replacement, so a
+    // request still finds the rows that `get` would find for it.
+    //
+    // Each row is deserialized once, so duplicate requests for one id share
+    // entry objects, as concurrent `MemoryStore` reads do.
+    const variantsById = Map.groupBy(
+      rows.map((row) => ({
+        id: row.resource_id,
+        vary: row.vary,
+        entry: this.deserializeEntry(
+          row.entry satisfies TableEntry<
+            Spec,
+            Validators,
+            Params,
+            Spec["id"]
+          > as unknown as TableEntry<Spec, Validators, Params, Spec["id"]>,
+        ),
+      })),
+      ({ id }) => id,
     );
+
+    const results = requests.map(({ id, params }) =>
+      (variantsById.get(id.toWellFormed()) ?? [])
+        .filter(({ vary }) => variantMatchesRequest(vary, params))
+        .map(({ entry }) => entry),
+    );
+
+    this.logTrace("returning entries from postgres getMany query", {
+      requestCount: requests.length,
+      uniqueIdCount: uniqueIds.length,
+      rowCount: rows.length,
+    });
+
+    return results as StoreGetManyResult<Spec, Reqs, Validators, Params>;
   }
 
   async store(

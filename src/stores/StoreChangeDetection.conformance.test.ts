@@ -8,7 +8,10 @@ import { describe, it } from "node:test";
 import { setTimeout as sleep } from "node:timers/promises";
 
 import { AnyValidatorsArb } from "../../test/arbitraries/02_Validators.js";
-import { postgresStoreFixture } from "../../test/fixtures.js";
+import {
+  postgresEnvironmentIsConfigured,
+  postgresStoreFixture,
+} from "../../test/fixtures.js";
 import type {
   AnyValidators,
   CacheSpec,
@@ -853,16 +856,4 @@ function makeEntry(
     initialAge: opts?.initialAge ?? 0,
     date: opts?.date ?? new Date("2024-01-01T00:00:00.000Z"),
   };
-}
-
-function postgresEnvironmentIsConfigured(): boolean {
-  return [
-    "DATABASE_HOST",
-    "DATABASE_PORT",
-    "DATABASE_NAME",
-    "DATABASE_USER",
-    "DATABASE_PASSWORD",
-  ].every(
-    (key) => typeof process.env[key] === "string" && process.env[key] !== "",
-  );
 }
