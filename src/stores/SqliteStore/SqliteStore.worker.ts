@@ -391,8 +391,12 @@ function getManyMatchingEntryJson(
     ({ resource_id }) => resource_id,
   );
 
+  // Look rows up by the id as SQLite stores it. SQLite receives each bound id
+  // as UTF-8, so a lone UTF-16 surrogate in a request id reaches the table, and
+  // comes back, as U+FFFD. `toWellFormed` makes the same replacement, so a
+  // request still finds the rows that `get` would find for it.
   return requests.map(({ id, params }) =>
-    (rowsById.get(id) ?? [])
+    (rowsById.get(id.toWellFormed()) ?? [])
       .filter((row) => variantMatchesRequest(jsonParse(row.vary), params))
       .map((row) => row.entry),
   );
