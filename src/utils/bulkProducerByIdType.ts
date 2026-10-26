@@ -204,71 +204,75 @@ export function bulkProducerByIdType<
     // oxlint-disable-next-line unicorn/no-new-array -- intentional preallocation; filled by index below
     const results: (LooseResult | Error)[] = new Array(reqs.length);
 
+    const byResourceType = new Map<string, (typeof classified)[number][]>();
+    await forEachCooperatively(classified, (item) => {
+      const group = byResourceType.get(item.resourceType);
+      if (group) group.push(item);
+      else byResourceType.set(item.resourceType, [item]);
+    });
+
     await Promise.all(
-      [...Map.groupBy(classified, (it) => it.resourceType).entries()].map(
-        async ([resourceType, entries]) => {
-          // Every member of a group resolved to the same resource type, hence
-          // to the same sub-producer. Non-null assertion is safe: Map.groupBy
-          // never makes an empty group.
-          const { subProducer } = entries[0]!;
+      [...byResourceType.entries()].map(async ([resourceType, entries]) => {
+        // Every member of a group resolved to the same resource type, hence
+        // to the same sub-producer. Each group contains at least one item.
+        const { subProducer } = entries[0]!;
 
-          // try/catch rather than a `.catch()` on the returned promise: a
-          // sub-producer that fails SYNCHRONOUSLY -- a non-async function with
-          // an argument-validation `throw`, or one whose first synchronous step
-          // throws (the hashed-input wrappers' internal producers read their
-          // input registry synchronously) -- never reaches a handler attached
-          // to its return value. That would take the whole MIXED batch down
-          // with it, discarding the other resource types' already-computed
-          // results and their store, for exactly the failure this helper
-          // promises to isolate to one type's slots.
-          let subResults: readonly (LooseResult | Error)[];
-          try {
-            subResults = await subProducer(
-              await mapCooperatively(entries, (it) => it.req),
-            );
-          } catch (error: unknown) {
-            // Per-request error isolation survives the merge: this type's
-            // slots settle as Error elements instead of failing the whole
-            // invocation. A non-Error failure is wrapped rather than stored
-            // raw, since a non-Error in a result slot would be read as a
-            // successful producer result; the original is kept as `cause`.
-            const asError =
-              error instanceof Error
-                ? error
-                : new Error(
-                    `bulkProducerByIdType: the "${resourceType}" producer rejected with a non-Error value`,
-                    { cause: error },
-                  );
-            subResults = await mapCooperatively(entries, () => asError);
-          }
+        // try/catch rather than a `.catch()` on the returned promise: a
+        // sub-producer that fails SYNCHRONOUSLY -- a non-async function with
+        // an argument-validation `throw`, or one whose first synchronous step
+        // throws (the hashed-input wrappers' internal producers read their
+        // input registry synchronously) -- never reaches a handler attached
+        // to its return value. That would take the whole MIXED batch down
+        // with it, discarding the other resource types' already-computed
+        // results and their store, for exactly the failure this helper
+        // promises to isolate to one type's slots.
+        let subResults: readonly (LooseResult | Error)[];
+        try {
+          subResults = await subProducer(
+            await mapCooperatively(entries, (it) => it.req),
+          );
+        } catch (error: unknown) {
+          // Per-request error isolation survives the merge: this type's
+          // slots settle as Error elements instead of failing the whole
+          // invocation. A non-Error failure is wrapped rather than stored
+          // raw, since a non-Error in a result slot would be read as a
+          // successful producer result; the original is kept as `cause`.
+          const asError =
+            error instanceof Error
+              ? error
+              : new Error(
+                  `bulkProducerByIdType: the "${resourceType}" producer rejected with a non-Error value`,
+                  { cause: error },
+                );
+          subResults = await mapCooperatively(entries, () => asError);
+        }
 
-          // Any count disagreement fails the whole invocation, rather than
-          // filling what came back and leaving the rest as holes for the
-          // wrapper's own under-return check to find: this names the offending
-          // resource type and both counts, where the wrapper -- which sees only
-          // the merged batch -- can report a total ("results for only 7 of 10
-          // requests") but never which sub-producer broke it. It also stops the
-          // merge resting on `undefined` as the "no result here" sentinel; that
-          // is sound (see the wrapper's check) but a count comparison needs no
-          // such premise. The failure path above is length-correct by
-          // construction, so this only fires for a sub-producer that returned.
-          if (subResults.length !== entries.length) {
-            throw new Error(
-              `bulkProducerByIdType: the "${resourceType}" producer returned a ` +
-                `result count (${String(subResults.length)}) that does not match ` +
-                `the number of requests in its slice (${String(entries.length)}); ` +
-                `each sub-producer must return exactly one result or Error per ` +
-                `request it was given`,
-            );
-          }
+        // Any count disagreement fails the whole invocation, rather than
+        // filling what came back and leaving the rest as holes for the
+        // wrapper's own under-return check to find: this names the offending
+        // resource type and both counts, where the wrapper -- which sees only
+        // the merged batch -- can report a total ("results for only 7 of 10
+        // requests") but never which sub-producer broke it. It also stops the
+        // merge resting on `undefined` as the "no result here" sentinel; that
+        // is sound (see the wrapper's check) but a count comparison needs no
+        // such premise. The failure path above is length-correct by
+        // construction, so this only fires for a sub-producer that returned.
+        if (subResults.length !== entries.length) {
+          throw new Error(
+            `bulkProducerByIdType: the "${resourceType}" producer returned a ` +
+              `result count (${String(subResults.length)}) that does not match ` +
+              `the number of requests in its slice (${String(entries.length)}); ` +
+              `each sub-producer must return exactly one result or Error per ` +
+              `request it was given`,
+          );
+        }
 
-          await forEachCooperatively(entries, (entry, j) => {
-            // SAFETY: the counts were just checked to match, so slot `j` of a
-            // sub-producer's results exists for every entry in its slice.
-            results[entry.index] = subResults[j]!;
-          });
-        },
-      ),
+        await forEachCooperatively(entries, (entry, j) => {
+          // SAFETY: the counts were just checked to match, so slot `j` of a
+          // sub-producer's results exists for every entry in its slice.
+          results[entry.index] = subResults[j]!;
+        });
+      }),
     );
 
     return results;

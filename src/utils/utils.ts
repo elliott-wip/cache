@@ -132,7 +132,7 @@ export async function keepMaxPerGroupCooperatively<T>(opts: {
     const previous = winners.get(key);
     if (!previous || max > previous.max) winners.set(key, { item, max });
   });
-  return mapCooperatively([...winners.values()], ({ item }) => item);
+  return mapCooperatively(winners.values(), ({ item }) => item);
 }
 
 /**

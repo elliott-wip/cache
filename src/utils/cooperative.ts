@@ -6,20 +6,22 @@ import { scheduler } from "node:timers/promises";
 let yieldAt = performance.now() + 8;
 
 export async function forEachCooperatively<T>(
-  items: readonly T[],
+  items: Iterable<T>,
   callback: (item: T, index: number) => void,
 ): Promise<void> {
-  for (let index = 0; index < items.length; index += 1) {
+  let index = 0;
+  for (const item of items) {
     if (index > 0 && performance.now() >= yieldAt) {
       await scheduler.yield();
       yieldAt = performance.now() + 8;
     }
-    callback(items[index]!, index);
+    callback(item, index);
+    index += 1;
   }
 }
 
 export async function mapCooperatively<T, R>(
-  items: readonly T[],
+  items: Iterable<T>,
   callback: (item: T, index: number) => R,
 ): Promise<R[]> {
   const results: R[] = [];
@@ -57,4 +59,15 @@ export async function stableStringifyArrayCooperatively(
 ): Promise<string> {
   const parts = await mapCooperatively(items, (item) => stableStringify(item));
   return `[${parts.join(",")}]`;
+}
+
+/** Build a map without a synchronous full-batch Map constructor pass. */
+export async function mapFromEntriesCooperatively<Key, Value>(
+  entries: Iterable<readonly [Key, Value]>,
+): Promise<Map<Key, Value>> {
+  const result = new Map<Key, Value>();
+  await forEachCooperatively(entries, ([key, value]) => {
+    result.set(key, value);
+  });
+  return result;
 }

@@ -10,7 +10,11 @@ import {
   type NormalizedParams,
   type SpecOf,
 } from "./index.js";
-import { stableStringifyArrayCooperatively } from "./utils/cooperative.js";
+import {
+  mapCooperatively,
+  mapFromEntriesCooperatively,
+  stableStringifyArrayCooperatively,
+} from "./utils/cooperative.js";
 import { wrapBulkProducer } from "./utils/wrapBulkProducer.js";
 
 const batchSize = 10_000;
@@ -495,6 +499,77 @@ it("a pre-aborted mixed batch publishes every aborted fetch before any read star
     assert.equal(producer.mock.callCount(), 0);
   } finally {
     cacheFetchChannel.unsubscribe(onFetch);
+    await cache.close();
+  }
+});
+
+it("cooperative map construction yields while consuming an iterable and keeps last duplicate values", async () => {
+  const state = { visited: 0, visitedAtTick: 0 };
+  function* entries(): IterableIterator<readonly [number, number]> {
+    for (let index = 0; index < batchSize; index += 1) {
+      const until = performance.now() + 0.002;
+      while (performance.now() < until) {
+        /* iterable entry work */
+      }
+      state.visited += 1;
+      yield [index % 100, index];
+    }
+  }
+  const tick = setImmediate().then(() => {
+    state.visitedAtTick = state.visited;
+  });
+  const result = await mapFromEntriesCooperatively(entries());
+  await tick;
+  assert.ok(state.visitedAtTick > 0 && state.visitedAtTick < batchSize);
+  assert.deepEqual(
+    [...result.keys()],
+    Array.from({ length: 100 }, (_, index) => index),
+  );
+  assert.deepEqual(
+    [...result.values()],
+    Array.from({ length: 100 }, (_, index) => batchSize - 100 + index),
+  );
+  assert.deepEqual(
+    await mapCooperatively(result.values(), (value) => value + 1),
+    [...result.values()].map((value) => value + 1),
+  );
+});
+
+it("ride bookkeeping yields without leaving a fast producer rejection unobserved", async () => {
+  const { cache } = makeCache();
+  const originalSet = Map.prototype.set;
+  const progress = { indexed: 0, indexedAtTick: 0, timer: Promise.resolve() };
+  const set = mock.method(
+    Map.prototype,
+    "set",
+    function (this: Map<unknown, unknown>, key: unknown, value: unknown) {
+      // Only the wrapper's per-request ride index uses these request objects as keys.
+      if (typeof key === "object" && key !== null && "settleFetchOnce" in key) {
+        if (progress.indexed === 0) {
+          progress.timer = setImmediate().then(() => {
+            progress.indexedAtTick = progress.indexed;
+          });
+        }
+        const until = performance.now() + 0.002;
+        while (performance.now() < until) {
+          /* ride-index work */
+        }
+        progress.indexed += 1;
+      }
+      return originalSet.call(this, key, value);
+    },
+  );
+  const failure = new Error("fast producer rejection during ride indexing");
+  const wrapped = wrapBulkProducer({ cache }, async () => {
+    throw failure;
+  });
+  try {
+    await assert.rejects(wrapped(requests), (error) => error === failure);
+    await progress.timer;
+    assert.equal(progress.indexed, batchSize);
+    assert.ok(progress.indexedAtTick > 0 && progress.indexedAtTick < batchSize);
+  } finally {
+    set.mock.restore();
     await cache.close();
   }
 });

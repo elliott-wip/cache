@@ -1,6 +1,7 @@
 import {
   mapCooperatively,
   forEachCooperatively,
+  mapFromEntriesCooperatively,
 } from "../../utils/cooperative.js";
 import { isNonEmptyArray } from "type-party/runtime/nonempty.js";
 import type { CacheSpec, SpecForId } from "../../types/00_CacheSpec.js";
@@ -286,7 +287,7 @@ export default class MemoryStore<
     // call, so snapshot every touched slot's current entry now, before any
     // write. Reading a slot more than once here is harmless: nothing has been
     // written yet, so each read of a slot returns the same pre-call value.
-    const preCallBySlot = new Map(
+    const preCallBySlot = await mapFromEntriesCooperatively(
       await mapCooperatively(
         prepared,
         ({ cacheKey }) => [cacheKey, this.entriesMap.get(cacheKey)] as const,
@@ -303,7 +304,7 @@ export default class MemoryStore<
     });
     await forEachCooperatively(winners, (it) => this.#persist(it));
 
-    const winnerIndexBySlot = new Map(
+    const winnerIndexBySlot = await mapFromEntriesCooperatively(
       await mapCooperatively(
         winners,
         ({ cacheKey, index }) => [cacheKey, index] as const,

@@ -328,15 +328,15 @@ export function wrapBulkProducer<
       // Extract all resources to store (main resources + supplemental resources),
       // but NOT requests that failed.
       const resourcesToStore = await flatMapCooperatively(
-        zip2(requestPairedProducerResults, reqs),
-        ([result, req]) =>
+        requestPairedProducerResults,
+        (result, index) =>
           result instanceof Error
             ? []
             : requestPairedProducerResultToResources<
                 SpecOf<RT>,
                 Validators,
                 Params
-              >(result, req.id),
+              >(result, reqs[index]!.id),
       );
 
       logTrace(`attempting to store resources from bulk producer response`, {
@@ -565,7 +565,7 @@ export function wrapBulkProducer<
       // Serializing one completed request at a time produces the same stable
       // JSON array key while allowing other event-loop work between elements.
       const collapseKey = await stableStringifyArrayCooperatively(
-        bareItems.map((item) => item.req),
+        await mapCooperatively(bareItems, (item) => item.req),
       );
       if (trigger !== "revalidation" && signal?.aborted) {
         throwAborted(
@@ -580,16 +580,13 @@ export function wrapBulkProducer<
         bareItems,
         collapseKey,
       );
-      bareItems.forEach((item) => {
-        attachedRides.set(item, attached.rode);
-      });
-
       const handled = attached.promise.then(
         async (producerResults): Promise<(LooseEntry | ErrorType)[]> => {
           // The invocation validates positional completeness before resolving.
           return mapCooperatively(
-            zip2(groupItems, producerResults),
-            ([{ item, usableIfError }, producerResult]) => {
+            groupItems,
+            ({ item, usableIfError }, index) => {
+              const producerResult = producerResults[index]!;
               if (producerResult instanceof Error) {
                 const fallback = usableIfError;
                 if (fallback) {
@@ -639,6 +636,12 @@ export function wrapBulkProducer<
         },
       );
 
+      // The ride-index pass can yield after the producer has already failed.
+      // Observe its rejection before that first yield without consuming it.
+      void handled.catch(() => {});
+      await forEachCooperatively(bareItems, (item) => {
+        attachedRides.set(item, attached.rode);
+      });
       return [{ items: bareItems, rode: attached.rode, handled }];
     };
 
@@ -722,7 +725,10 @@ export function wrapBulkProducer<
       throwAbortedForAllPending();
     }
 
-    const itemsWithCacheResults = zip2(readItems, cacheResults);
+    const itemsWithCacheResults = await mapCooperatively(
+      readItems,
+      (item, index) => [item, cacheResults[index]!] as const,
+    );
 
     // Results are written straight into their caller-order slot via
     // `item.index`, so there is no identity map to keep consistent. Sparse by
