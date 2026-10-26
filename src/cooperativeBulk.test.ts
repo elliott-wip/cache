@@ -537,6 +537,7 @@ it("cooperative map construction yields while consuming an iterable and keeps la
 
 it("ride bookkeeping yields without leaving a fast producer rejection unobserved", async () => {
   const { cache } = makeCache();
+  // oxlint-disable-next-line typescript/unbound-method -- The interceptor calls this captured method with its original receiver below.
   const originalSet = Map.prototype.set;
   const progress = { indexed: 0, indexedAtTick: 0, timer: Promise.resolve() };
   const set = mock.method(
