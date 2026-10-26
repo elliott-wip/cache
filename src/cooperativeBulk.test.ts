@@ -324,7 +324,7 @@ function makeLifecycleCache(duringNormalization: (cache: Cache) => void) {
     name: "cooperative-lifecycle",
     resourceTypes: {
       resources: resourceType<unknown>()({
-        matches: (id): id is string => true,
+        matches: (_id): _id is string => true,
       }),
     },
     store,
