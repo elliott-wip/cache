@@ -1,4 +1,8 @@
-import { isNonEmptyArray, mapNonEmpty } from "type-party/runtime/nonempty.js";
+import {
+  mapCooperatively,
+  forEachCooperatively,
+} from "../../utils/cooperative.js";
+import { isNonEmptyArray } from "type-party/runtime/nonempty.js";
 import type { CacheSpec, SpecForId } from "../../types/00_CacheSpec.js";
 import type {
   StoreEntryResult,
@@ -20,7 +24,11 @@ import {
   validatorsEqual,
 } from "../../utils/normalizedProducerResultResourceHelpers.js";
 import type { JsonOf } from "../../utils/utils.js";
-import { jsonStringify, keepMaxPerGroup } from "../../utils/utils.js";
+import {
+  jsonStringify,
+  keepMaxPerGroup,
+  keepMaxPerGroupCooperatively,
+} from "../../utils/utils.js";
 import {
   requestVariantKeyForVaryKeys,
   resultVariantKey,
@@ -161,8 +169,15 @@ export default class MemoryStore<
     options?: { signal?: AbortSignal },
   ): Promise<StoreGetManyResult<Spec, Reqs, Validators, Params>> {
     options?.signal?.throwIfAborted();
+    if (requests.length <= 32) {
+      return requests.map((it) =>
+        this.#getOneSync(it.id, it.params),
+      ) as StoreGetManyResult<Spec, Reqs, Validators, Params>;
+    }
     return isNonEmptyArray(requests)
-      ? mapNonEmpty(requests, (it) => this.#getOneSync(it.id, it.params))
+      ? ((await mapCooperatively(requests, (it) =>
+          this.#getOneSync(it.id, it.params),
+        )) as StoreGetManyResult<Spec, Reqs, Validators, Params>)
       : ([] as StoreGetManyResult<Spec, Reqs, Validators, Params>);
   }
 
@@ -194,11 +209,33 @@ export default class MemoryStore<
     });
   }
 
+  private storeTail: Promise<unknown> = Promise.resolve();
+  private pendingStores = 0;
+
   public async store(
     entriesWithTimes: readonly StoreEntryInput<Spec, Validators, Params>[],
   ): Promise<readonly StoreEntryResult[]> {
-    // Derive each input's slot (variant + full cache key) once, up front.
-    const prepared = entriesWithTimes.map((input, index) => {
+    // Keep overlapping writers ordered while their bulk passes yield. Each
+    // call still compares every slot to its state before that call writes.
+    // Single-entry callers depend on writes happening before store() returns
+    // its promise (wrapProducer deliberately does not await that promise).
+    if (entriesWithTimes.length <= 32 && this.pendingStores === 0) {
+      return Promise.resolve(this.#storeSmall(entriesWithTimes));
+    }
+    this.pendingStores += 1;
+    const pending = this.storeTail.then(() => this.#store(entriesWithTimes));
+    this.storeTail = pending
+      .finally(() => {
+        this.pendingStores -= 1;
+      })
+      .catch(() => {});
+    return pending;
+  }
+
+  #storeSmall(
+    entries: readonly StoreEntryInput<Spec, Validators, Params>[],
+  ): readonly StoreEntryResult[] {
+    const prepared = entries.map((input, index) => {
       const variantKey = resultVariantKey(input.entry.vary);
       return {
         input,
@@ -207,33 +244,76 @@ export default class MemoryStore<
         cacheKey: makeCacheKey(input.entry.id, variantKey),
       };
     });
-
-    // The relationship is measured against what each slot held BEFORE this
-    // call, so snapshot every touched slot's current entry now, before any
-    // write. Reading a slot more than once here is harmless: nothing has been
-    // written yet, so each read of a slot returns the same pre-call value.
     const preCallBySlot = new Map(
-      prepared.map(({ cacheKey }) => [cacheKey, this.entriesMap.get(cacheKey)] as const),
+      prepared.map(
+        ({ cacheKey }) => [cacheKey, this.entriesMap.get(cacheKey)] as const,
+      ),
     );
-
-    // Dedupe within the call per the contract's uniform rule: for each slot,
-    // only the entry with the newest birth date persists (the same rule the
-    // other stores apply).
     const winners = keepMaxPerGroup({
       items: prepared,
       groupBy: (it) => it.cacheKey,
       maxBy: (it) => birthDate(it.input.entry).valueOf(),
     });
     winners.forEach((it) => this.#persist(it));
-
     const winnerIndexBySlot = new Map(
       winners.map(({ cacheKey, index }) => [cacheKey, index] as const),
+    );
+    return prepared.map(({ input, index, cacheKey }) =>
+      winnerIndexBySlot.get(cacheKey) === index
+        ? this.#relationshipToExisting(input.entry, preCallBySlot.get(cacheKey))
+        : {},
+    );
+  }
+
+  async #store(
+    entriesWithTimes: readonly StoreEntryInput<Spec, Validators, Params>[],
+  ): Promise<readonly StoreEntryResult[]> {
+    // Derive each input's slot (variant + full cache key) once, up front.
+    const prepared = await mapCooperatively(
+      entriesWithTimes,
+      (input, index) => {
+        const variantKey = resultVariantKey(input.entry.vary);
+        return {
+          input,
+          index,
+          variantKey,
+          cacheKey: makeCacheKey(input.entry.id, variantKey),
+        };
+      },
+    );
+
+    // The relationship is measured against what each slot held BEFORE this
+    // call, so snapshot every touched slot's current entry now, before any
+    // write. Reading a slot more than once here is harmless: nothing has been
+    // written yet, so each read of a slot returns the same pre-call value.
+    const preCallBySlot = new Map(
+      await mapCooperatively(
+        prepared,
+        ({ cacheKey }) => [cacheKey, this.entriesMap.get(cacheKey)] as const,
+      ),
+    );
+
+    // Dedupe within the call per the contract's uniform rule: for each slot,
+    // only the entry with the newest birth date persists (the same rule the
+    // other stores apply).
+    const winners = await keepMaxPerGroupCooperatively({
+      items: prepared,
+      groupBy: (it) => it.cacheKey,
+      maxBy: (it) => birthDate(it.input.entry).valueOf(),
+    });
+    await forEachCooperatively(winners, (it) => this.#persist(it));
+
+    const winnerIndexBySlot = new Map(
+      await mapCooperatively(
+        winners,
+        ({ cacheKey, index }) => [cacheKey, index] as const,
+      ),
     );
 
     // Each slot's winner reports how its validators relate to that slot's
     // pre-call entry; every other input (a dropped within-call duplicate) is
     // omitted.
-    return prepared.map(({ input, index, cacheKey }) =>
+    return await mapCooperatively(prepared, ({ input, index, cacheKey }) =>
       winnerIndexBySlot.get(cacheKey) === index
         ? this.#relationshipToExisting(input.entry, preCallBySlot.get(cacheKey))
         : {},
@@ -285,7 +365,9 @@ export default class MemoryStore<
 
   #relationshipToExisting(
     entry: Entry<Spec, Validators, Params>,
-    existing: readonly [Entry<Spec, Validators, Params>, Spec["id"]] | undefined,
+    existing:
+      | readonly [Entry<Spec, Validators, Params>, Spec["id"]]
+      | undefined,
   ): StoreEntryResult {
     // This store holds raw in-memory objects, so normalize BOTH sides to their
     // JSON-serialized form before checking emptiness or comparing, to agree
@@ -308,6 +390,8 @@ export default class MemoryStore<
   }
 
   public async delete(id: Spec["id"]) {
+    // A later invalidation must not be overtaken by a yielded earlier write.
+    if (this.pendingStores > 0) await this.storeTail;
     const resourceMetadata = this.resourceMetadataMap.get(id);
     if (!resourceMetadata) {
       return;
@@ -322,6 +406,7 @@ export default class MemoryStore<
   }
 
   public async close() {
+    if (this.pendingStores > 0) await this.storeTail;
     this.entriesMap.close();
   }
 

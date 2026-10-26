@@ -1,3 +1,4 @@
+import { mapCooperatively, forEachCooperatively } from "./cooperative.js";
 /**
  * @fileoverview Per-resource-type dispatch for BULK producers: the bulk
  * counterpart of `producerByIdType`, and the sub-producer vocabulary that only
@@ -185,7 +186,7 @@ export function bulkProducerByIdType<
     // unroutable element contacts no origin at all. Unreachable through the
     // wrapper unless the registry here disagrees with the cache's; reachable
     // whenever the returned producer is driven directly.
-    const classified = reqs.map((req, index) => ({
+    const classified = await mapCooperatively(reqs, (req, index) => ({
       index,
       req,
       ...resolveCoveredSubProducer(
@@ -222,7 +223,9 @@ export function bulkProducerByIdType<
           // promises to isolate to one type's slots.
           let subResults: readonly (LooseResult | Error)[];
           try {
-            subResults = await subProducer(entries.map((it) => it.req));
+            subResults = await subProducer(
+              await mapCooperatively(entries, (it) => it.req),
+            );
           } catch (error: unknown) {
             // Per-request error isolation survives the merge: this type's
             // slots settle as Error elements instead of failing the whole
@@ -236,7 +239,7 @@ export function bulkProducerByIdType<
                     `bulkProducerByIdType: the "${resourceType}" producer rejected with a non-Error value`,
                     { cause: error },
                   );
-            subResults = entries.map(() => asError);
+            subResults = await mapCooperatively(entries, () => asError);
           }
 
           // Any count disagreement fails the whole invocation, rather than
@@ -259,7 +262,7 @@ export function bulkProducerByIdType<
             );
           }
 
-          entries.forEach((entry, j) => {
+          await forEachCooperatively(entries, (entry, j) => {
             // SAFETY: the counts were just checked to match, so slot `j` of a
             // sub-producer's results exists for every entry in its slice.
             results[entry.index] = subResults[j]!;

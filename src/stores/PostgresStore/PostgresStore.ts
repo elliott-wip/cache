@@ -1,9 +1,5 @@
-import type {
-  ColumnType,
-  PostgresPool,
-  RawBuilder,
-  SqlBool,
-} from "kysely";
+import { mapCooperatively } from "../../utils/cooperative.js";
+import type { ColumnType, PostgresPool, RawBuilder, SqlBool } from "kysely";
 import { Kysely, PostgresDialect, sql } from "kysely";
 import type { Tagged } from "type-fest";
 import type {
@@ -44,7 +40,7 @@ import {
 import {
   defaultLoggersByComponent,
   jsonStringify,
-  keepMaxPerGroup,
+  keepMaxPerGroupCooperatively,
   naiveGetMany,
 } from "../../utils/utils.js";
 
@@ -294,8 +290,11 @@ export default class PostgresStore<
     // query, so collapse entries that share a slot (id + vary), keeping the
     // newest by birth date. Dropped duplicates report `{}` (they weren't the
     // value compared/stored).
-    const deduped = keepMaxPerGroup({
-      items: entries.map((it, originalIndex) => ({ it, originalIndex })),
+    const deduped = await keepMaxPerGroupCooperatively({
+      items: await mapCooperatively(entries, (it, originalIndex) => ({
+        it,
+        originalIndex,
+      })),
       groupBy: ({ it }) => this.slotKey(it.entry),
       maxBy: ({ it }) => entryUtils.birthDate(it.entry).getTime(),
     });
@@ -306,23 +305,23 @@ export default class PostgresStore<
     // concurrent calls whose batches share >= 2 slots in DIFFERENT orders
     // could otherwise deadlock (each holding a row the other is waiting on).
     // With a consistent order, the later call just waits for the earlier one.
-    const rows = deduped
-      .map(({ it }) => ({
+    const rows = (
+      await mapCooperatively(deduped, ({ it }) => ({
         resource_id: it.entry.id,
         vary: this.serializeVary(it.entry.vary),
         entry: this.serializeEntry(it.entry),
       }))
-      .toSorted((a, b) =>
-        a.resource_id < b.resource_id
-          ? -1
-          : a.resource_id > b.resource_id
-            ? 1
-            : a.vary < b.vary
-              ? -1
-              : a.vary > b.vary
-                ? 1
-                : 0,
-      );
+    ).toSorted((a, b) =>
+      a.resource_id < b.resource_id
+        ? -1
+        : a.resource_id > b.resource_id
+          ? 1
+          : a.vary < b.vary
+            ? -1
+            : a.vary > b.vary
+              ? 1
+              : 0,
+    );
     const resourceIds = [...new Set(deduped.map(({ it }) => it.entry.id))];
 
     // One statement with two sibling CTEs sharing a single snapshot: `old` reads
@@ -386,24 +385,35 @@ export default class PostgresStore<
     // Index each affected slot's pre-call validators, so a slot with no row here
     // is one that didn't exist before the call (i.e. "is-new").
     const oldValidatorsBySlot = new Map(
-      oldRows.map((row) => [
-        this.slotKey({ id: row.resource_id, vary: row.vary }),
-        row.validators,
-      ]),
+      await mapCooperatively(
+        oldRows,
+        (row) =>
+          [
+            this.slotKey({ id: row.resource_id, vary: row.vary }),
+            row.validators,
+          ] as const,
+      ),
     );
 
     // Each deduped ("winner") entry reports its relationship, keyed back to its
     // original input index.
     const resultByInputIndex = new Map<number, StoreEntryResult>(
-      deduped.map(({ it, originalIndex }) => [
-        originalIndex,
-        this.#relationshipToExisting(it.entry, oldValidatorsBySlot),
-      ]),
+      await mapCooperatively(
+        deduped,
+        ({ it, originalIndex }) =>
+          [
+            originalIndex,
+            this.#relationshipToExisting(it.entry, oldValidatorsBySlot),
+          ] as const,
+      ),
     );
 
     // Map back onto the full input order; every input that isn't a winner (a
     // dropped within-call duplicate) isn't in the map and so is omitted.
-    return entries.map((_entry, index) => resultByInputIndex.get(index) ?? {});
+    return mapCooperatively(
+      entries,
+      (_entry, index) => resultByInputIndex.get(index) ?? {},
+    );
   }
 
   /**

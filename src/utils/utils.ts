@@ -1,3 +1,4 @@
+import { mapCooperatively, forEachCooperatively } from "./cooperative.js";
 import { default as debug } from "debug";
 import { maxBy } from "es-toolkit";
 
@@ -118,6 +119,22 @@ export function keepMaxPerGroup<T>(opts: {
     .toArray();
 }
 
+/** Cooperative equivalent of keepMaxPerGroup for bulk store paths. */
+export async function keepMaxPerGroupCooperatively<T>(opts: {
+  items: readonly T[];
+  groupBy: (item: T) => string;
+  maxBy: (item: T) => number;
+}): Promise<T[]> {
+  const winners = new Map<string, { item: T; max: number }>();
+  await forEachCooperatively(opts.items, (item) => {
+    const key = opts.groupBy(item);
+    const max = opts.maxBy(item);
+    const previous = winners.get(key);
+    if (!previous || max > previous.max) winners.set(key, { item, max });
+  });
+  return mapCooperatively([...winners.values()], ({ item }) => item);
+}
+
 /**
  * A naive implementation of the `getMany` method that uses the store's `get`
  * method to fulfill all requests with limited parallelism.
@@ -152,9 +169,14 @@ export async function naiveGetMany<
   const limit = pLimit(maxConcurrency);
 
   // Process all requests with controlled concurrency
-  const promises = requests.map(async (request) =>
-    limit(async () => store.get(request.id, request.params, options)),
-  );
+  const promises = await mapCooperatively(requests, (request) => {
+    const pending = limit(async () =>
+      store.get(request.id, request.params, options),
+    );
+    // A yielded enrollment pass may outlive an early store rejection.
+    void pending.catch(() => {});
+    return pending;
+  });
 
   const res = await Promise.all(promises);
   return res satisfies Entry<
